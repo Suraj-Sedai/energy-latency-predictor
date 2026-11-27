@@ -96,7 +96,7 @@ with torch.no_grad():  # no gradients: saves memory and time, we never train her
     warmup_start = time.perf_counter()
     warmup_runs = 0
     while time.perf_counter() - warmup_start < WARMUP_SECONDS:
-        decode(model(input_ids, use_cache=True), steps=DECODE_STEPS)
+        decode(model(input_ids, use_cache=True, logits_to_keep=1), steps=DECODE_STEPS)
         torch.cuda.synchronize()      # so the time check sees GPU work done, not just launched
         warmup_runs += 1
     print(f"Warm-up: {warmup_runs} runs over {time.perf_counter() - warmup_start:.1f} s")
@@ -115,7 +115,10 @@ with torch.no_grad():  # no gradients: saves memory and time, we never train her
         # --- Timed prefill: one forward pass over the whole prompt = TTFT ---
         torch.cuda.synchronize()
         start = time.perf_counter()
-        out = model(input_ids, use_cache=True)    # fresh prefill = fresh KV cache for this repeat
+        # Fresh prefill = fresh KV cache for this repeat. logits_to_keep=1: only the last position's
+        # logits are computed, the only ones decode uses. The full (batch, prompt_len, vocab) logits
+        # are wasted work and, at large batch x prompt length, gigabytes of memory.
+        out = model(input_ids, use_cache=True, logits_to_keep=1)
         torch.cuda.synchronize()      # wait for the GPU to actually finish before stopping the clock
         ttft_s.append(time.perf_counter() - start)
 
