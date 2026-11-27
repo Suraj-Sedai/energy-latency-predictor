@@ -3,6 +3,7 @@
     python sweep.py                                  # full sweep, all five models (~270 runs)
     python sweep.py --models openai-community/gpt2 --out data/dry_run.csv    # dry run
     python sweep.py --models TinyLlama/TinyLlama_v1.1 --batches 64 128 --out data/dry_run_big.csv
+    python sweep.py --out-dir /content/drive/MyDrive/energy --idle-max-w 30     # e.g. on Colab
 
 Models run one at a time (load, run all its configs, free). Within a model the configs run in a
 shuffled order, so slow drift (heat, background load) spreads across configs instead of landing
@@ -45,7 +46,7 @@ DECODE_STEPS = NEW_TOKENS - 1   # forced: no end-of-sequence check, so it always
 SETTLE_SECONDS = 10.0  # fixed wait before measuring idle, so power drops back after model load
 IDLE_SECONDS = 5.0     # how long to sit idle when measuring idle power
 IDLE_SAMPLE_S = 0.1    # how often to sample power while idle
-IDLE_MAX_WATTS = 12.5  # clean idle on this laptop reads ~11.6-12.4 W; above this something else is on the GPU
+IDLE_MAX_WATTS = 12.5  # default for --idle-max-w: clean idle on this laptop reads ~11.6-12.4 W
 IDLE_ATTEMPTS = 3      # re-measure idle this many times before giving up
 
 MODEL_WARMUP_S = 2.0   # discarded warm-up per model: kernels loaded, clocks back up after idle/load
@@ -94,7 +95,7 @@ def measure_idle():
     return sum(samples) / len(samples), len(samples)
 
 
-def checked_idle():
+def checked_idle(idle_max_w):
     """Idle power once per session. On this laptop the GPU also drives the desktop, so another app
     can add load. If idle reads high, measure again; if it never comes down, stop the session."""
     for attempt in range(1, IDLE_ATTEMPTS + 1):
@@ -102,9 +103,9 @@ def checked_idle():
         clock, temp = gpu_state()
         print(f"Idle power: {watts:.2f} W (mean of {n} samples over {IDLE_SECONDS:.0f} s), "
               f"SM {clock} MHz, {temp} C  [attempt {attempt}/{IDLE_ATTEMPTS}]")
-        if watts <= IDLE_MAX_WATTS:
+        if watts <= idle_max_w:
             return watts
-    raise SystemExit(f"Idle stayed above {IDLE_MAX_WATTS} W. Close apps using the GPU "
+    raise SystemExit(f"Idle stayed above {idle_max_w} W. Close apps using the GPU "
                      f"(browser, video, overlays) and run again.")
 
 
@@ -206,14 +207,28 @@ def main():
     parser.add_argument("--prompt-lens", nargs="+", type=int, default=PROMPT_LENS)
     slug = re.sub(r"[^a-z0-9]+", "_", GPU_NAME.lower()).strip("_")
     parser.add_argument("--out", default=f"data/sweep_v2_{slug}.csv", help="one CSV per GPU")
+    parser.add_argument("--out-dir", default=None,
+                        help="directory for the CSV, e.g. a mounted Google Drive folder on Colab; "
+                             "the file keeps the name from --out (or the default name)")
+    parser.add_argument("--idle-max-w", type=float, default=IDLE_MAX_WATTS,
+                        help="stop the session if idle power stays above this (W); 12.5 suits the laptop")
     parser.add_argument("--seed", type=int, default=0, help="seed for the shuffled run order")
     args = parser.parse_args()
+    if args.out_dir:
+        args.out = os.path.join(args.out_dir, os.path.basename(args.out))
 
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     # Never add rows to an existing sweep: a new run gets a new file, so no two sessions
-    # (different idle baselines, different code) end up mixed in one CSV.
+    # (different idle baselines, different code) end up mixed in one CSV. Checked first,
+    # so a name clash fails at once instead of after the idle measurement.
     if os.path.exists(args.out) and os.path.getsize(args.out) > 0:
         raise SystemExit(f"{args.out} already exists. Pick a new --out; old sweeps are never overwritten.")
+
+    # Idle check BEFORE the CSV (or its folder) exists: if it fails, nothing is left behind
+    # to block the next run with "already exists".
+    print(f"GPU: {GPU_NAME}   ->  {args.out}")
+    idle_watts = checked_idle(args.idle_max_w)
+
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     new_file = True
     f = open(args.out, "a", newline="")
     writer = csv.DictWriter(f, fieldnames=COLUMNS)
@@ -225,8 +240,6 @@ def main():
         f.flush()
         os.fsync(f.fileno())          # on disk now, not sitting in a buffer
 
-    print(f"GPU: {GPU_NAME}   ->  {args.out}")
-    idle_watts = checked_idle()
     rng = random.Random(args.seed)
     total = len(args.models) * len(args.batches) * len(args.prompt_lens) * REPEATS
     done = 0
